@@ -8534,6 +8534,7 @@ var Git = class {
   }
   cwd;
   versionCache;
+  firstParentLines = /* @__PURE__ */ new Map();
   /** Run git; throws GitError unless the exit code is in `okStatus`. */
   run(args, opts = {}) {
     const ok = opts.okStatus ?? [0];
@@ -8576,6 +8577,15 @@ var Git = class {
   }
   isAncestor(a, b) {
     return this.run(["merge-base", "--is-ancestor", a, b], { okStatus: [0, 1] }).status === 0;
+  }
+  /** Every commit on rev's own line: the first-parent chain, without side branches merged into it. */
+  firstParentLine(rev) {
+    let line = this.firstParentLines.get(rev);
+    if (!line) {
+      line = new Set(this.run(["rev-list", "--first-parent", rev]).stdout.split("\n").filter(Boolean));
+      this.firstParentLines.set(rev, line);
+    }
+    return line;
   }
   /** File content at rev:path, or undefined when the path does not exist there. */
   show(rev, path) {
@@ -8632,6 +8642,87 @@ function total(bag) {
 }
 function significant(line) {
   return /[A-Za-z0-9]/.test(line);
+}
+
+// src/soften.ts
+var MOVED_NOTE = "its lines appear elsewhere in the merge, so it may have been moved";
+var SOFTEN_NOTE = {
+  "version-only": "only version numbers or commit ids differ, so this is a warning",
+  generated: "generated file, so this is a warning"
+};
+var NEVER_SOFTENED = [
+  ...DEFAULT_IGNORE,
+  "**/Pipfile.lock",
+  "**/flake.lock",
+  "**/packages.lock.json",
+  "**/gradle.lockfile",
+  "**/Package.resolved",
+  "**/Podfile.lock",
+  "**/mix.lock",
+  "**/pubspec.lock",
+  "**/.github/**",
+  "**/Dockerfile",
+  "**/Dockerfile.*",
+  "**/*.dockerfile",
+  "**/docker-compose*.y*ml",
+  "**/compose*.y*ml"
+];
+var GENERATED_PATHS = [
+  "**/__snapshots__/**",
+  "**/*.snap",
+  "**/*.ambr",
+  "**/*.golden",
+  "**/baselines/**",
+  "**/*.generated.*",
+  "**/*.g.cs",
+  "**/*.pb.go",
+  "**/*_pb2.py",
+  "**/*.min.js",
+  "**/*.min.css"
+];
+var GENERATED_HEADER = /@generated|\bDO NOT EDIT\b|\bauto-?generated\b/i;
+var HEADER_LINES = 5;
+var VERSION = /(?<![\d.])v?\d+\.\d+\.\d+(?![.\d])(?:[-+][0-9A-Za-z.+-]*)?|\b[0-9a-f]{40}\b/g;
+var PLACEHOLDER = "\0";
+var MOVED_MIN_LENGTH = 20;
+var normalize = (line) => line.trim().replace(VERSION, PLACEHOLDER);
+function isVersionOnly(h) {
+  if (h.added.length === 0 || h.removed.length === 0) return false;
+  const counts = /* @__PURE__ */ new Map();
+  for (const line of h.removed) {
+    const n = normalize(line);
+    counts.set(n, (counts.get(n) ?? 0) + 1);
+  }
+  let paired = 0;
+  for (const line of h.added) {
+    const n = normalize(line);
+    const left = counts.get(n) ?? 0;
+    if (left > 0 && n.includes(PLACEHOLDER)) {
+      counts.set(n, left - 1);
+      paired++;
+    }
+  }
+  const longest = Math.max(h.added.length, h.removed.length);
+  return paired === longest;
+}
+function linesAddedByMerge(parentToMerge) {
+  const lines = /* @__PURE__ */ new Set();
+  for (const f of parentToMerge) for (const b of f.blocks) for (const l of b.added) lines.add(l.trim());
+  return lines;
+}
+function isMoved(h, elsewhere) {
+  const lines = h.added.filter(significant).map((l) => l.trim());
+  return lines.some((l) => l.length >= MOVED_MIN_LENGTH) && lines.every((l) => elsewhere.has(l));
+}
+function isExemptFromSoftening(...paths) {
+  return paths.some((p) => p !== void 0 && matchesAny(p, NEVER_SOFTENED));
+}
+function isGenerated(git, rev, path) {
+  if (matchesAny(path, GENERATED_PATHS)) return true;
+  const attr = git.run(["check-attr", "--source", rev, "linguist-generated", "--", path], { okStatus: [0, 1, 128, 129] });
+  if (attr.status === 0 && /: linguist-generated: (set|true)\s*$/.test(attr.stdout)) return true;
+  const head = git.show(rev, path);
+  return head !== void 0 && GENERATED_HEADER.test(head.split("\n", HEADER_LINES).join("\n"));
 }
 
 // src/analyze.ts
@@ -8720,7 +8811,10 @@ function analyzeTwoParent(git, report, opts) {
 }
 function mainParentIndex(git, m, p1, p2, mainSha) {
   if (!mainSha) return void 0;
-  if (git.isAncestor(m, mainSha)) return 0;
+  const line = git.firstParentLine(mainSha);
+  if (line.has(m)) return 0;
+  if (line.has(p2)) return 1;
+  if (line.has(p1)) return 0;
   if (git.isAncestor(p2, mainSha)) return 1;
   if (git.isAncestor(p1, mainSha)) return 0;
   return 1;
@@ -8750,6 +8844,13 @@ function findDrops(git, ctx) {
     ...f
   });
   const sideWord = side === "main" ? "main" : "the branch";
+  const addedByMerge = linesAddedByMerge(mapFiles);
+  const soften = (f, reason) => {
+    if (f.kind !== "dropped" || f.level !== "error" || isExemptFromSoftening(f.path, f.parentPath)) return;
+    f.level = "warning";
+    f.softened = reason;
+    f.message += ` (${SOFTEN_NOTE[reason]})`;
+  };
   for (const sf of candidates) {
     if (sf.status === "D") {
       const old = sf.oldPath;
@@ -8813,7 +8914,7 @@ function findDrops(git, ctx) {
         removed: h.removed
       });
       const what = describeHunk(h);
-      out.push(mk(v.kind, {
+      const finding = mk(v.kind, {
         path: mPath,
         parentPath: p !== mPath ? p : void 0,
         conflicted,
@@ -8824,8 +8925,18 @@ function findDrops(git, ctx) {
         removed: h.removed.slice(0, SNIPPET),
         actual: mLines.slice(v.mFrom, v.mTo).slice(0, SNIPPET),
         commit
-      }));
+      });
+      if (isVersionOnly(h)) soften(finding, "version-only");
+      else if (finding.kind === "dropped" && isMoved(h, addedByMerge)) finding.message += ` (${MOVED_NOTE})`;
+      out.push(finding);
     }
+  }
+  const generated = /* @__PURE__ */ new Map();
+  for (const f of out) {
+    if (f.level !== "error") continue;
+    const inParent = f.parentPath ?? f.path;
+    if (!generated.has(inParent)) generated.set(inParent, isGenerated(git, parent, inParent));
+    if (generated.get(inParent)) soften(f, "generated");
   }
   return out;
 }
@@ -9022,7 +9133,7 @@ var package_default = {
 };
 
 // src/version.ts
-var VERSION = package_default.version;
+var VERSION2 = package_default.version;
 
 // src/check.ts
 function repoRoot(cwd) {
@@ -9070,7 +9181,7 @@ function runCheck(opts) {
   );
   return {
     tool: BRAND.productName,
-    version: VERSION,
+    version: VERSION2,
     repo: root,
     range,
     mainRef: main?.ref,
@@ -9103,7 +9214,7 @@ function exitCodeFor(report, failOn = "warning") {
 var import_node_fs5 = require("node:fs");
 var import_node_path4 = require("node:path");
 function apiClient(token, apiUrl) {
-  return new GitHub({ token: token || void 0, apiUrl, userAgent: `${BRAND.cliName}/${VERSION}` });
+  return new GitHub({ token: token || void 0, apiUrl, userAgent: `${BRAND.cliName}/${VERSION2}` });
 }
 function extendsFetcher(git, root, rev, gh) {
   return {

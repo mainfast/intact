@@ -107,6 +107,25 @@ intact:
 
 The human report folds repeated lockfile hunks into one line per file.
 
+### Dropped changes reported as warnings
+
+A dropped main change normally fails the check. Two kinds are reported as warnings instead,
+because they are usually harmless, and the finding says which one applied:
+
+- **Version bumps:** the change only differs in `x.y.z` version numbers or full commit ids.
+- **Generated files:** snapshots, `baselines/` folders, files with `linguist-generated` in
+  `.gitattributes`, or a generated-code header such as `@generated` or `DO NOT EDIT`.
+
+Lockfiles, `.github/` and Docker image files stay errors. If every line of a dropped change
+appears elsewhere in the merge, the finding notes it may have been moved, but it still fails,
+because the merge author wrote those lines. A dropped version bump can still be a security
+fix, so to make these fail on paths you care about, add a `severity` entry:
+
+```yaml
+intact:
+  severity: { "eng/Versions.props": error }
+```
+
 ### Shared org config: `extends:` (Pro)
 
 Put one policy in a repository the whole org can read and build on it everywhere:
