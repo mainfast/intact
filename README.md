@@ -182,17 +182,6 @@ jobs:
   summary and the check run get one notice about Pro. The result never changes.
 - A shallow checkout is unshallowed automatically; `fetch-depth: 0` is faster.
 
-### Claude Code plugin
-
-`plugin/` holds a skill (`intact`) that runs the bundled CLI before a push and
-tells the agent how to read and act on findings. `npm run build` copies the CLI
-into `plugin/scripts/mainfast.cjs` (not `bin/`: claude.ai org sync rejects plugins
-with a top-level `bin/`).
-
-```bash
-claude plugin validate plugin
-```
-
 ## How it works
 
 For each two-parent merge commit `M = merge(P1, P2)`:
@@ -259,3 +248,7 @@ library). Shared code (GitHub client, Actions I/O, globs, config loader, plan ga
 
 Tests build real throwaway git repositories in temp dirs (`test/scenarios.test.ts`).
 Design note for the hosted App: [`docs/github-app.md`](https://github.com/mainfast/mainfast/blob/main/intact/docs/github-app.md).
+
+## Report a problem
+
+Found a bug or a false positive? [Open an issue](https://github.com/mainfast/mainfast/issues) in the main Mainfast repository. Anyone can, free, with no key. Issues are public, so leave out private code and secrets.
